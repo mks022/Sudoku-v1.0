@@ -104,6 +104,7 @@ class TransactionKind(str, Enum):
     network = "network"
     system = "system"
     chat = "chat"
+    narration = "narration"
 
 
 class TransactionEvent(BaseModel):
@@ -142,4 +143,5 @@ class ChatReply(BaseModel):
     assistant_message: MessageOut
     rag_context: list[str] = Field(default_factory=list)
     tools_used: list[str] = Field(default_factory=list)
+    narrations: list[dict[str, Any]] = Field(default_factory=list)
     transactions: list[TransactionEvent] = Field(default_factory=list)

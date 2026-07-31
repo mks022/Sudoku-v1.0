@@ -31,8 +31,9 @@ export function ConsolePage() {
         </div>
         <h1>NetGuard</h1>
         <p>
-          Pipecat voice pipeline with STT, TTS, LLM, Silero VAD, and MCP mitigation tools — resilient to
-          provider and network faults.
+          Pipecat voice pipeline with STT, TTS, LLM, VAD, and MCP mitigation tools — resilient to
+          provider and network faults. While troubleshooting, NetGuard narrates each breadcrumb into
+          the conversation and TTS so you can stay engaged mid-pass.
         </p>
         <div className="row-actions">
           <a className="btn btn-primary" href="#channel">
@@ -45,7 +46,7 @@ export function ConsolePage() {
       </section>
 
       <div className="grid-2" id="channel">
-        <ConsoleChat />
+        <ConsoleChat liveEvents={events} />
         <div style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
           <LiveTransactions events={events} connected={connected} />
           <div className="panel">

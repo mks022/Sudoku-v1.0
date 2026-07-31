@@ -347,9 +347,11 @@ h3 {
   border: 1px solid rgba(76, 201, 240, 0.25);
 }
 
-.msg.assistant {
-  background: rgba(61, 255, 154, 0.08);
-  border: 1px solid rgba(61, 255, 154, 0.2);
+.msg.narration {
+  background: rgba(255, 176, 32, 0.08);
+  border: 1px dashed rgba(255, 176, 32, 0.35);
+  max-width: 92%;
+  font-size: 0.9rem;
 }
 
 .hero-console {

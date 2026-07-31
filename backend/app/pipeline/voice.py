@@ -111,8 +111,63 @@ class VoiceSession:
             detail=text[:160],
         )
 
+        async def on_progress(item: dict[str, Any]) -> None:
+            text = str(item.get("text") or "")
+            await self.send_json(
+                {
+                    "type": "narration",
+                    "call_id": self.call_id,
+                    "phase": item.get("phase"),
+                    "text": text,
+                    "speak": True,
+                    "message_id": item.get("message_id"),
+                }
+            )
+            # Speak each breadcrumb while troubleshooting is in flight
+            tts_cfgs = await providers_by_kind(session, "tts")
+            tts = next((c for c in tts_cfgs if c.enabled), None)
+            can_tts = False
+            if tts:
+                auth = str((tts.extra or {}).get("auth_scheme") or "bearer").lower()
+                can_tts = bool(tts.api_key) or auth == "none"
+            audio_b64 = None
+            if tts and can_tts and text:
+                try:
+                    audio_b64 = await self._synthesize(tts, text)
+                    await event_bus.emit(
+                        TransactionKind.tts,
+                        "TTS narration step",
+                        status="success",
+                        provider=tts.provider,
+                        call_id=self.call_id,
+                        detail=item.get("phase"),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    await event_bus.emit(
+                        TransactionKind.tts,
+                        "TTS narration failed",
+                        status="fallback",
+                        provider=tts.provider,
+                        call_id=self.call_id,
+                        detail=str(exc),
+                    )
+            await self.send_json(
+                {
+                    "type": "narration_audio",
+                    "call_id": self.call_id,
+                    "phase": item.get("phase"),
+                    "text": text,
+                    "audio_b64": audio_b64,
+                    "mime": "audio/mpeg" if audio_b64 else None,
+                }
+            )
+
         result = await agent_service.handle_chat(
-            session, content=text, call_id=self.call_id, channel="voice"
+            session,
+            content=text,
+            call_id=self.call_id,
+            channel="voice",
+            on_progress=on_progress,
         )
         reply = result["assistant_message"].content
         await self.send_json(
@@ -122,51 +177,20 @@ class VoiceSession:
                 "text": reply,
                 "tools": result["tools_used"],
                 "rag": result["rag_context"],
+                "narrations": result.get("narrations") or [],
+                # Final bubble is textual summary; step TTS already played.
+                "speak": False,
             }
         )
-
-        # TTS: emit event; optional base64 audio if provider configured
-        tts_cfgs = await providers_by_kind(session, "tts")
-        tts = next((c for c in tts_cfgs if c.enabled), None)
-        audio_b64 = None
-        can_tts = False
-        if tts:
-            auth = str((tts.extra or {}).get("auth_scheme") or "bearer").lower()
-            can_tts = bool(tts.api_key) or auth == "none"
-        if tts and can_tts:
-            try:
-                audio_b64 = await self._synthesize(tts, reply)
-                await event_bus.emit(
-                    TransactionKind.tts,
-                    "TTS complete",
-                    status="success",
-                    provider=tts.provider,
-                    call_id=self.call_id,
-                )
-            except Exception as exc:  # noqa: BLE001
-                await event_bus.emit(
-                    TransactionKind.tts,
-                    "TTS failed — falling back to text",
-                    status="fallback",
-                    provider=tts.provider if tts else "",
-                    call_id=self.call_id,
-                    detail=str(exc),
-                )
-        else:
-            await event_bus.emit(
-                TransactionKind.tts,
-                "TTS text-only (no provider/key)",
-                status="info",
-                call_id=self.call_id,
-            )
 
         await self.send_json(
             {
                 "type": "assistant_audio",
                 "call_id": self.call_id,
-                "audio_b64": audio_b64,
-                "mime": "audio/mpeg" if audio_b64 else None,
+                "audio_b64": None,
+                "mime": None,
                 "text": reply,
+                "note": "Step narrations were spoken live; final summary is text-only to avoid repeat.",
             }
         )
 
@@ -194,8 +218,8 @@ def pipeline_info() -> dict[str, Any]:
         "stages": ["transport", "vad", "stt", "llm+rag+mcp", "tts", "transport"],
         "resilience": ["retry", "circuit_breaker", "provider_fallback", "text_degrade"],
         "note": (
-            "Providers are protocol-driven and fully user-configured. "
-            "Voice WebSocket accepts audio chunks + utterance_end; chat always available."
+            "Providers are protocol-driven. Troubleshooting narrations stream live to chat/TTS "
+            "while mitigation runs; operators can keep talking mid-pass."
         ),
     }
 
@@ -221,11 +245,24 @@ async def handle_voice_ws(websocket: Any, session_factory, call_id: int) -> None
                 elif mtype == "utterance_end":
                     await voice.on_utterance_end(session, transcript=msg.get("transcript"))
                 elif mtype == "chat":
+                    async def on_progress(item: dict[str, Any]) -> None:
+                        await voice.send_json(
+                            {
+                                "type": "narration",
+                                "call_id": call_id,
+                                "phase": item.get("phase"),
+                                "text": item.get("text"),
+                                "speak": True,
+                                "message_id": item.get("message_id"),
+                            }
+                        )
+
                     result = await agent_service.handle_chat(
                         session,
                         content=msg.get("text", ""),
                         call_id=call_id,
                         channel="hybrid",
+                        on_progress=on_progress,
                     )
                     await voice.send_json(
                         {
@@ -234,6 +271,8 @@ async def handle_voice_ws(websocket: Any, session_factory, call_id: int) -> None
                             "text": result["assistant_message"].content,
                             "tools": result["tools_used"],
                             "rag": result["rag_context"],
+                            "narrations": result.get("narrations") or [],
+                            "speak": False,
                         }
                     )
                 elif mtype == "ping":

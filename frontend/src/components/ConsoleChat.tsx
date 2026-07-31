@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { api, Message, wsUrl } from "../lib/api";
+import { api, Message, TransactionEvent, wsUrl } from "../lib/api";
 
 type SpeechRec = {
   continuous: boolean;
@@ -20,18 +20,37 @@ function getSpeechRecognition(): (new () => SpeechRec) | null {
   return w.SpeechRecognition || w.webkitSpeechRecognition || null;
 }
 
-export function ConsoleChat() {
+function speakText(text: string) {
+  if (!text || !("speechSynthesis" in window)) return;
+  const u = new SpeechSynthesisUtterance(text.slice(0, 500));
+  u.rate = 1.05;
+  window.speechSynthesis.speak(u);
+}
+
+export function ConsoleChat({
+  liveEvents = [],
+}: {
+  liveEvents?: TransactionEvent[];
+}) {
   const [callId, setCallId] = useState<number | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [listening, setListening] = useState(false);
+  const [speakLive, setSpeakLive] = useState(true);
   const [ragHints, setRagHints] = useState<string[]>([]);
   const [tools, setTools] = useState<string[]>([]);
+  const [phase, setPhase] = useState("");
   const [error, setError] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<SpeechRec | null>(null);
   const voiceWsRef = useRef<WebSocket | null>(null);
+  const seenNarrationKeys = useRef<Set<string>>(new Set());
+  const callIdRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    callIdRef.current = callId;
+  }, [callId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -41,13 +60,54 @@ export function ConsoleChat() {
     return () => {
       recognitionRef.current?.stop();
       voiceWsRef.current?.close();
+      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     };
   }, []);
+
+  // Engage live troubleshooting breadcrumbs into the conversation + TTS
+  useEffect(() => {
+    if (!liveEvents.length) return;
+    const latest = liveEvents[liveEvents.length - 1];
+    if (!latest || latest.kind !== "narration") return;
+    if (callIdRef.current && latest.call_id && latest.call_id !== callIdRef.current) return;
+
+    const text = latest.detail || latest.title;
+    const phaseName = String(latest.meta?.phase || "step");
+    const key = `${latest.call_id || callIdRef.current}:${phaseName}:${text}`;
+    if (seenNarrationKeys.current.has(key)) return;
+    seenNarrationKeys.current.add(key);
+    // also mark event id
+    if (latest.id) seenNarrationKeys.current.add(latest.id);    setPhase(phaseName);
+    setBusy(true);
+
+    const msg: Message = {
+      id: Number(latest.meta?.message_id) || Date.now(),
+      call_id: latest.call_id || callIdRef.current || 0,
+      role: "assistant",
+      content: text,
+      created_at: latest.created_at,
+      meta: { narration: true, phase: phaseName, speak: true },
+    };
+    setMessages((prev) => {
+      if (prev.some((m) => m.id === msg.id && m.content === msg.content)) return prev;
+      return [...prev, msg];
+    });
+
+    if (speakLive && latest.meta?.speak !== false) {
+      speakText(text);
+    }
+
+    if (phaseName === "wrap") {
+      setBusy(false);
+      setPhase("");
+    }
+  }, [liveEvents, speakLive]);
 
   async function ensureSession(): Promise<number> {
     if (callId) return callId;
     const call = await api.calls.create("hybrid", "Live console session");
     setCallId(call.id);
+    callIdRef.current = call.id;
     return call.id;
   }
 
@@ -58,7 +118,35 @@ export function ConsoleChat() {
     ws.onmessage = (ev) => {
       try {
         const msg = JSON.parse(ev.data);
-        if (msg.type === "assistant_text") {
+        if (msg.type === "narration" && msg.text) {
+          const key = `${id}:${msg.phase || "step"}:${msg.text}`;
+          if (seenNarrationKeys.current.has(key)) return;
+          seenNarrationKeys.current.add(key);
+          if (msg.message_id) seenNarrationKeys.current.add(String(msg.message_id));
+          setPhase(String(msg.phase || "step"));
+          setBusy(true);
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: msg.message_id || Date.now(),
+              call_id: id,
+              role: "assistant",
+              content: msg.text,
+              created_at: new Date().toISOString(),
+              meta: { narration: true, phase: msg.phase, speak: true },
+            },
+          ]);
+          if (speakLive && msg.speak !== false) speakText(msg.text);
+        } else if (msg.type === "narration_audio" && msg.audio_b64) {          try {
+            const bytes = Uint8Array.from(atob(msg.audio_b64), (c) => c.charCodeAt(0));
+            const blob = new Blob([bytes], { type: msg.mime || "audio/mpeg" });
+            const url = URL.createObjectURL(blob);
+            const audio = new Audio(url);
+            void audio.play();
+          } catch {
+            /* browser TTS already covers narration text */
+          }
+        } else if (msg.type === "assistant_text") {
           setMessages((prev) => [
             ...prev,
             {
@@ -67,15 +155,14 @@ export function ConsoleChat() {
               role: "assistant",
               content: msg.text,
               created_at: new Date().toISOString(),
-              meta: {},
+              meta: { final: true },
             },
           ]);
           setTools(msg.tools || []);
           setRagHints(msg.rag || []);
-          if (msg.text && "speechSynthesis" in window) {
-            const u = new SpeechSynthesisUtterance(msg.text.slice(0, 500));
-            window.speechSynthesis.speak(u);
-          }
+          setBusy(false);
+          setPhase("");
+          if (msg.speak && speakLive) speakText(msg.text);
         }
       } catch {
         /* ignore */
@@ -85,11 +172,12 @@ export function ConsoleChat() {
 
   async function sendText(text: string) {
     const trimmed = text.trim();
-    if (!trimmed || busy) return;
-    setBusy(true);
+    if (!trimmed) return;
+    // Allow follow-ups while troubleshooting; only block exact empty double-sends
     setError("");
     try {
       const id = await ensureSession();
+      await openVoiceSocket(id);
       const optimistic: Message = {
         id: Date.now(),
         call_id: id,
@@ -100,22 +188,36 @@ export function ConsoleChat() {
       };
       setMessages((prev) => [...prev, optimistic]);
       setInput("");
+      setBusy(true);
+      setPhase("start");
+
+      // Prefer voice/hybrid WS so narrations stream with optional provider TTS
+      const ws = voiceWsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "chat", text: trimmed }));
+        return;
+      }
+
       const res = await api.chat(trimmed, id, "hybrid");
       setCallId(res.call_id);
       setMessages((prev) => {
         const withoutOpt = prev.filter((m) => m.id !== optimistic.id);
-        return [...withoutOpt, res.user_message, res.assistant_message];
+        // Narrations may already be present from the live transaction stream.
+        const hasFinal = withoutOpt.some(
+          (m) => m.role === "assistant" && !m.meta?.narration && m.content === res.assistant_message.content
+        );
+        const next = [...withoutOpt, res.user_message];
+        if (!hasFinal) next.push(res.assistant_message);
+        return next;
       });
       setRagHints(res.rag_context || []);
       setTools(res.tools_used || []);
-      if (res.assistant_message.content && "speechSynthesis" in window && listening) {
-        const u = new SpeechSynthesisUtterance(res.assistant_message.content.slice(0, 500));
-        window.speechSynthesis.speak(u);
-      }
+      setBusy(false);
+      setPhase("");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-    } finally {
       setBusy(false);
+      setPhase("");
     }
   }
 
@@ -158,6 +260,8 @@ export function ConsoleChat() {
             meta: { via: "voice" },
           },
         ]);
+        setBusy(true);
+        setPhase("start");
       } else {
         void sendText(transcript);
       }
@@ -174,28 +278,48 @@ export function ConsoleChat() {
     await api.calls.end(callId);
     voiceWsRef.current?.send(JSON.stringify({ type: "close" }));
     voiceWsRef.current?.close();
+    if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     setCallId(null);
     setMessages([]);
     setTools([]);
     setRagHints([]);
+    setBusy(false);
+    setPhase("");
+    seenNarrationKeys.current.clear();
   }
 
   return (
     <div className="panel" style={{ display: "flex", flexDirection: "column", minHeight: 520 }}>
-      <div className="panel-title" style={{ display: "flex", justifyContent: "space-between", gap: "0.5rem" }}>
-        <span>Operator channel · voice + chat</span>
-        <span className="badge info">call {callId ?? "—"}</span>
+      <div className="panel-title" style={{ display: "flex", justifyContent: "space-between", gap: "0.5rem", flexWrap: "wrap" }}>
+        <span>Operator channel · live troubleshooting</span>
+        <span style={{ display: "flex", gap: "0.4rem", alignItems: "center" }}>
+          {busy && (
+            <span className="badge warn">
+              <span className="live-dot" style={{ background: "var(--warn)" }} />
+              troubleshooting{phase ? ` · ${phase}` : ""}
+            </span>
+          )}
+          <span className="badge info">call {callId ?? "—"}</span>
+        </span>
       </div>
 
       <div className="scroll-y" style={{ flex: 1 }}>
         {messages.length === 0 && (
           <div className="empty">
             Ask about BGP flaps, DNS timeouts, PoP health, or say “simulate fault at AMS-1”.
-            Keys go in Providers — demo mode works without them.
+            While I mitigate, I’ll narrate each breadcrumb — you can keep talking.
           </div>
         )}
         {messages.map((m) => (
-          <div key={m.id} className={`msg ${m.role}`}>
+          <div
+            key={`${m.id}-${m.created_at}-${(m.meta?.phase as string) || ""}`}
+            className={`msg ${m.role}${m.meta?.narration ? " narration" : ""}`}
+          >
+            {Boolean(m.meta?.narration) && (
+              <div style={{ fontSize: "0.68rem", color: "var(--muted)", marginBottom: 4 }}>
+                live · {String(m.meta?.phase || "step")}
+              </div>
+            )}
             {m.content}
           </div>
         ))}
@@ -233,6 +357,11 @@ export function ConsoleChat() {
         </div>
       )}
 
+      <label className="switch" style={{ marginTop: "0.75rem" }}>
+        <input type="checkbox" checked={speakLive} onChange={(e) => setSpeakLive(e.target.checked)} />
+        Speak troubleshooting breadcrumbs (TTS)
+      </label>
+
       <form className="chat-compose" onSubmit={onSubmit}>
         <button
           type="button"
@@ -246,11 +375,10 @@ export function ConsoleChat() {
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="Type a mitigation request…"
-          disabled={busy}
+          placeholder={busy ? "Keep talking — ask a follow-up mid-troubleshoot…" : "Type a mitigation request…"}
         />
-        <button className="btn btn-primary" type="submit" disabled={busy || !input.trim()}>
-          Send
+        <button className="btn btn-primary" type="submit" disabled={!input.trim()}>
+          {busy ? "Send anyway" : "Send"}
         </button>
         <button className="btn btn-ghost" type="button" onClick={() => void endSession()} disabled={!callId}>
           End

@@ -123,6 +123,7 @@ export const api = {
       assistant_message: Message;
       rag_context: string[];
       tools_used: string[];
+      narrations?: Array<{ phase: string; text: string; speak?: boolean }>;
     }>("/chat", {
       method: "POST",
       body: JSON.stringify({ content, call_id, channel }),

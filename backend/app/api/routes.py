@@ -241,6 +241,7 @@ async def chat(payload: MessageIn, session: AsyncSession = Depends(get_session))
         ),
         rag_context=result["rag_context"],
         tools_used=result["tools_used"],
+        narrations=result.get("narrations") or [],
         transactions=event_bus.history()[-20:],
     )
 

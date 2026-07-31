@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -223,11 +224,109 @@ class AgentService:
                 found.append(payload)
         return found
 
-    async def _run_actions(self, text: str, call_id: int | None) -> list[str]:
+    async def _narrate(
+        self,
+        session: AsyncSession,
+        *,
+        call_id: int,
+        text: str,
+        phase: str,
+        on_progress: Any | None = None,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        """Push a speakable troubleshooting breadcrumb into the live conversation."""
+        item = {
+            "phase": phase,
+            "text": text,
+            "speak": True,
+            "call_id": call_id,
+            "ts": time.time(),
+        }
+        await event_bus.emit(
+            TransactionKind.narration,
+            f"Narration · {phase}",
+            status="info",
+            detail=text,
+            call_id=call_id,
+            meta=item,
+        )
+        if persist:
+            msg = Message(
+                call_id=call_id,
+                role=MessageRole.assistant.value,
+                content=text,
+                meta={"narration": True, "phase": phase, "speak": True},
+            )
+            session.add(msg)
+            await session.commit()
+            await session.refresh(msg)
+            item["message_id"] = msg.id
+        if on_progress:
+            maybe = on_progress(item)
+            if asyncio.iscoroutine(maybe):
+                await maybe
+        return item
+
+    def _tool_start_line(self, tool: str, args: dict[str, Any]) -> str:
+        if tool == "get_network_status":
+            region = args.get("region")
+            return (
+                f"Checking live PoP health{f' in {region}' if region else ''} now."
+            )
+        if tool == "dampen_bgp_peer":
+            return f"Dampening BGP peer {args.get('peer', 'target')} for {args.get('minutes', 15)} minutes."
+        if tool == "shift_anycast_weight":
+            return (
+                f"Shifting {args.get('amount', 25)} anycast weight "
+                f"from {args.get('from_pop')} to {args.get('to_pop')}."
+            )
+        if tool == "open_provider_circuit":
+            state = "Opening" if args.get("open_", True) else "Closing"
+            return f"{state} the circuit breaker for provider {args.get('provider')}."
+        if tool == "set_dns_override":
+            return f"Pinning DNS for {args.get('hostname')} to {args.get('target')}."
+        if tool == "simulate_fault":
+            return f"Injecting a synthetic fault at {args.get('pop')} for the drill."
+        if tool == "heal_pop":
+            return f"Restoring {args.get('pop')} to a healthy baseline."
+        return f"Running mitigation tool {tool}."
+
+    async def _run_actions(
+        self,
+        session: AsyncSession,
+        text: str,
+        call_id: int | None,
+        on_progress: Any | None = None,
+    ) -> tuple[list[str], list[dict[str, Any]]]:
         used: list[str] = []
-        for payload in self._extract_actions(text):
+        narrations: list[dict[str, Any]] = []
+        actions = self._extract_actions(text)
+        if not actions or call_id is None:
+            return used, narrations
+
+        if len(actions) > 1:
+            n = await self._narrate(
+                session,
+                call_id=call_id,
+                text=f"I have {len(actions)} mitigation steps. I'll talk through each as I go.",
+                phase="plan",
+                on_progress=on_progress,
+            )
+            narrations.append(n)
+
+        for payload in actions:
             tool = payload["tool"]
             args = payload.get("args") or {}
+            start_line = self._tool_start_line(tool, args)
+            n = await self._narrate(
+                session,
+                call_id=call_id,
+                text=start_line,
+                phase=f"tool_start:{tool}",
+                on_progress=on_progress,
+            )
+            narrations.append(n)
+
             await event_bus.emit(
                 TransactionKind.mcp,
                 f"MCP tool: {tool}",
@@ -250,7 +349,23 @@ class AgentService:
                 meta=result.data,
             )
             used.append(f"{tool}: {result.summary}")
-        return used
+            result_line = (
+                result.summary
+                if result.ok
+                else f"That step failed: {result.summary}. We can try another path."
+            )
+            n = await self._narrate(
+                session,
+                call_id=call_id,
+                text=result_line,
+                phase=f"tool_result:{tool}",
+                on_progress=on_progress,
+            )
+            narrations.append(n)
+            # Brief pause so TTS / UI can breathe between steps
+            await asyncio.sleep(0.12)
+
+        return used, narrations
 
     def _strip_actions(self, text: str) -> str:
         cleaned = ACTION_LINE_RE.sub("", text)
@@ -262,6 +377,7 @@ class AgentService:
         content: str,
         call_id: Optional[int] = None,
         channel: str = "chat",
+        on_progress: Any | None = None,
     ) -> dict[str, Any]:
         if call_id:
             call = await session.get(CallRecord, call_id)
@@ -288,6 +404,16 @@ class AgentService:
             call_id=call.id,
         )
 
+        narrations: list[dict[str, Any]] = []
+        n = await self._narrate(
+            session,
+            call_id=call.id,
+            text="On it — I'll troubleshoot this live and keep you posted as I go.",
+            phase="start",
+            on_progress=on_progress,
+        )
+        narrations.append(n)
+
         # RAG retrieval transaction
         rag_started = time.perf_counter()
         prompt, rag_snips = self._build_prompt(content, history)
@@ -312,6 +438,27 @@ class AgentService:
             latency_ms=rag_latency,
             meta={"chunks": rag_snips},
         )
+
+        if rag_snips:
+            n = await self._narrate(
+                session,
+                call_id=call.id,
+                text=(
+                    f"I found {len(rag_snips)} related outage or runbook notes. "
+                    f"Top match: {rag_snips[0].split(':')[0][:80]}."
+                ),
+                phase="rag",
+                on_progress=on_progress,
+            )
+        else:
+            n = await self._narrate(
+                session,
+                call_id=call.id,
+                text="No close historical match — I'll lean on live status and standard playbooks.",
+                phase="rag",
+                on_progress=on_progress,
+            )
+        narrations.append(n)
 
         llm_cfgs = await providers_by_kind(session, "llm")
 
@@ -338,6 +485,16 @@ class AgentService:
                 status = "fallback"
             if kind == "attempt" and payload.get("attempt", 1) > 1:
                 status = "retry"
+            if status in {"retry", "fallback"}:
+                reason = "failing over to a backup provider" if status == "fallback" else "retrying the model"
+                nn = await self._narrate(
+                    session,
+                    call_id=call.id,
+                    text=f"Hit a provider snag — {reason}.",
+                    phase=f"llm_{status}",
+                    on_progress=on_progress,
+                )
+                narrations.append(nn)
             ev = await event_bus.emit(
                 TransactionKind.llm,
                 f"LLM {kind}",
@@ -361,27 +518,62 @@ class AgentService:
                 meta=payload,
             )
 
+        n = await self._narrate(
+            session,
+            call_id=call.id,
+            text="Thinking through the mitigation plan.",
+            phase="llm",
+            on_progress=on_progress,
+        )
+        narrations.append(n)
+
         try:
             result = await self.executor.execute(slots, attempts=settings.llm_retry_attempts, on_event=on_event)
             raw = result.value
         except Exception as exc:  # noqa: BLE001
-            raw = (
-                f"I could not reach any LLM provider ({exc}). "
-                "Configure API keys in Providers, or continue in demo mode after adding a blank key."
-            )
-            # Force demo once
+            _ = exc
             raw = await self._demo_llm(content)
+            nn = await self._narrate(
+                session,
+                call_id=call.id,
+                text="Primary LLM path failed — continuing with the local demo playbook.",
+                phase="llm_fallback",
+                on_progress=on_progress,
+            )
+            narrations.append(nn)
 
-        tools_used = await self._run_actions(raw, call.id)
+        tools_used, tool_narrations = await self._run_actions(
+            session, raw, call.id, on_progress=on_progress
+        )
+        narrations.extend(tool_narrations)
+
         spoken = self._strip_actions(raw)
+        if not spoken:
+            spoken = "Troubleshooting pass complete."
         if tools_used:
-            spoken = f"{spoken}\n\nMitigation results:\n- " + "\n- ".join(tools_used)
+            wrap = (
+                "That wraps this pass. You can ask me to verify status, undo a step, or continue."
+            )
+            chat_content = f"{spoken}\n\nMitigation results:\n- " + "\n- ".join(tools_used)
+        else:
+            wrap = spoken
+            chat_content = spoken
+
+        n = await self._narrate(
+            session,
+            call_id=call.id,
+            text=wrap if tools_used else f"Here's my read: {spoken}",
+            phase="wrap",
+            on_progress=on_progress,
+            persist=False,  # final assistant message holds the durable summary
+        )
+        narrations.append(n)
 
         asst = Message(
             call_id=call.id,
             role=MessageRole.assistant.value,
-            content=spoken,
-            meta={"tools": tools_used, "rag": rag_snips},
+            content=chat_content,
+            meta={"tools": tools_used, "rag": rag_snips, "narrations": narrations},
         )
         session.add(asst)
         await session.commit()
@@ -391,7 +583,7 @@ class AgentService:
             TransactionKind.chat,
             "Assistant reply",
             status="success",
-            detail=spoken[:240],
+            detail=chat_content[:240],
             call_id=call.id,
         )
 
@@ -422,7 +614,7 @@ class AgentService:
                 status="success",
                 provider=(tts.provider if tts else "unconfigured"),
                 call_id=call.id,
-                detail=f"{len(spoken)} chars",
+                detail=f"{len(chat_content)} chars",
             )
 
         return {
@@ -431,6 +623,7 @@ class AgentService:
             "assistant_message": asst,
             "rag_context": rag_snips,
             "tools_used": tools_used,
+            "narrations": narrations,
         }
 
 
