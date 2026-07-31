@@ -11,12 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.config import settings
-from app.mcp_tools.network import invoke_tool, tools_prompt_block
+from app.mcp_tools.network import cleanup_pass_tools, invoke_tool_tracked, tools_prompt_block
 from app.models.db import CallRecord, Message, TransactionLog
 from app.models.schemas import MessageRole, TransactionKind
 from app.rag.index import rag_index
 from app.resilience.executor import ProviderSlot, ResilientExecutor
 from app.services.events import event_bus
+from app.services.pass_manager import PassAborted, TroubleshootingPass, pass_manager
 from app.services.providers import providers_by_kind
 SYSTEM_PROMPT = """You are NetGuard, a network fault mitigation voice/chat agent.
 You help operators diagnose and mitigate network incidents using live status,
@@ -233,14 +234,18 @@ class AgentService:
         phase: str,
         on_progress: Any | None = None,
         persist: bool = True,
+        pass_obj: TroubleshootingPass | None = None,
     ) -> dict[str, Any]:
         """Push a speakable troubleshooting breadcrumb into the live conversation."""
+        if pass_obj:
+            pass_obj.checkpoint(phase)
         item = {
             "phase": phase,
             "text": text,
             "speak": True,
             "call_id": call_id,
             "ts": time.time(),
+            "pass_id": pass_obj.pass_id if pass_obj else None,
         }
         await event_bus.emit(
             TransactionKind.narration,
@@ -255,7 +260,7 @@ class AgentService:
                 call_id=call_id,
                 role=MessageRole.assistant.value,
                 content=text,
-                meta={"narration": True, "phase": phase, "speak": True},
+                meta={"narration": True, "phase": phase, "speak": True, "pass_id": item["pass_id"]},
             )
             session.add(msg)
             await session.commit()
@@ -297,12 +302,16 @@ class AgentService:
         text: str,
         call_id: int | None,
         on_progress: Any | None = None,
+        pass_obj: TroubleshootingPass | None = None,
     ) -> tuple[list[str], list[dict[str, Any]]]:
         used: list[str] = []
         narrations: list[dict[str, Any]] = []
         actions = self._extract_actions(text)
         if not actions or call_id is None:
             return used, narrations
+
+        if pass_obj:
+            pass_obj.checkpoint("mcp_plan")
 
         if len(actions) > 1:
             n = await self._narrate(
@@ -311,10 +320,13 @@ class AgentService:
                 text=f"I have {len(actions)} mitigation steps. I'll talk through each as I go.",
                 phase="plan",
                 on_progress=on_progress,
+                pass_obj=pass_obj,
             )
             narrations.append(n)
 
         for payload in actions:
+            if pass_obj:
+                pass_obj.checkpoint(f"mcp:{payload.get('tool')}")
             tool = payload["tool"]
             args = payload.get("args") or {}
             start_line = self._tool_start_line(tool, args)
@@ -324,6 +336,7 @@ class AgentService:
                 text=start_line,
                 phase=f"tool_start:{tool}",
                 on_progress=on_progress,
+                pass_obj=pass_obj,
             )
             narrations.append(n)
 
@@ -336,7 +349,27 @@ class AgentService:
                 call_id=call_id,
             )
             started = time.perf_counter()
-            result = await invoke_tool(tool, **args)
+            try:
+                if pass_obj:
+                    result = await pass_obj.run(
+                        invoke_tool_tracked(
+                            call_id, tool, pass_id=pass_obj.pass_id, **args
+                        )
+                    )
+                else:
+                    result = await invoke_tool_tracked(call_id, tool, **args)
+            except PassAborted:
+                await event_bus.emit(
+                    TransactionKind.mcp,
+                    f"MCP {tool}: aborted",
+                    status="failed",
+                    detail="Operator superseded this approach",
+                    provider="builtin-network",
+                    call_id=call_id,
+                )
+                if pass_obj:
+                    await cleanup_pass_tools(call_id, pass_id=pass_obj.pass_id)
+                raise
             latency = (time.perf_counter() - started) * 1000
             await event_bus.emit(
                 TransactionKind.mcp,
@@ -349,6 +382,17 @@ class AgentService:
                 meta=result.data,
             )
             used.append(f"{tool}: {result.summary}")
+            if result.data.get("aborted"):
+                n = await self._narrate(
+                    session,
+                    call_id=call_id,
+                    text=f"Stopped {tool} — switching approaches.",
+                    phase=f"tool_abort:{tool}",
+                    on_progress=on_progress,
+                    pass_obj=pass_obj,
+                )
+                narrations.append(n)
+                break
             result_line = (
                 result.summary
                 if result.ok
@@ -360,9 +404,9 @@ class AgentService:
                 text=result_line,
                 phase=f"tool_result:{tool}",
                 on_progress=on_progress,
+                pass_obj=pass_obj,
             )
             narrations.append(n)
-            # Brief pause so TTS / UI can breathe between steps
             await asyncio.sleep(0.12)
 
         return used, narrations
@@ -378,6 +422,8 @@ class AgentService:
         call_id: Optional[int] = None,
         channel: str = "chat",
         on_progress: Any | None = None,
+        abort_current: bool = True,
+        supersede_reason: str = "operator_new_approach",
     ) -> dict[str, Any]:
         if call_id:
             call = await session.get(CallRecord, call_id)
@@ -386,12 +432,55 @@ class AgentService:
         else:
             call = await self.create_call(session, channel=channel)
 
+        abort_info: dict[str, Any] | None = None
+        narrations: list[dict[str, Any]] = []
+        if abort_current and pass_manager.is_active(call.id):
+            # Announce abort before tearing down so the operator hears the switch.
+            await event_bus.emit(
+                TransactionKind.system,
+                "Aborting active MCP pass",
+                status="info",
+                detail=supersede_reason,
+                call_id=call.id,
+            )
+            abort_info = await pass_manager.abort(call.id, reason=supersede_reason, wait=True)
+            # Only clean tools belonging to the aborted pass, not a successor.
+            aborted_pass_id = abort_info.get("pass_id")
+            tool_cleanup = await cleanup_pass_tools(call.id, pass_id=aborted_pass_id)
+            if abort_info.get("aborted"):
+                abort_info["mcp_cleanup"] = tool_cleanup
+                n = await self._narrate(
+                    session,
+                    call_id=call.id,
+                    text=(
+                        "Understood — aborting the current mitigation pass, "
+                        "closing MCP tool threads, then starting your new approach."
+                    ),
+                    phase="abort",
+                    on_progress=on_progress,
+                )
+                narrations.append(n)
+
+        pass_obj, begin_abort = await pass_manager.begin(
+            call.id,
+            abort_existing=abort_current,
+            reason=supersede_reason,
+            meta={"channel": channel, "content": content[:120]},
+        )
+        if begin_abort and not abort_info:
+            abort_info = begin_abort
+
         history_stmt = (
             select(Message).where(Message.call_id == call.id).order_by(Message.created_at.asc())
         )
         history = list((await session.execute(history_stmt)).scalars().all())
 
-        user_msg = Message(call_id=call.id, role=MessageRole.user.value, content=content)
+        user_msg = Message(
+            call_id=call.id,
+            role=MessageRole.user.value,
+            content=content,
+            meta={"pass_id": pass_obj.pass_id, "supersede": bool(abort_info)},
+        )
         session.add(user_msg)
         await session.commit()
         await session.refresh(user_msg)
@@ -402,178 +491,244 @@ class AgentService:
             status="info",
             detail=content[:240],
             call_id=call.id,
+            meta={"pass_id": pass_obj.pass_id},
         )
 
-        narrations: list[dict[str, Any]] = []
-        n = await self._narrate(
-            session,
-            call_id=call.id,
-            text="On it — I'll troubleshoot this live and keep you posted as I go.",
-            phase="start",
-            on_progress=on_progress,
-        )
-        narrations.append(n)
+        aborted = False
+        tools_used: list[str] = []
+        rag_snips: list[str] = []
+        chat_content = ""
 
-        # RAG retrieval transaction
-        rag_started = time.perf_counter()
-        prompt, rag_snips = self._build_prompt(content, history)
-        rag_latency = (time.perf_counter() - rag_started) * 1000
-        rag_ev = await event_bus.emit(
-            TransactionKind.rag,
-            "RAG retrieval",
-            status="success",
-            detail=f"{len(rag_snips)} chunks",
-            call_id=call.id,
-            latency_ms=rag_latency,
-            meta={"chunks": rag_snips},
-        )
-        await self._persist_tx(
-            session,
-            event_id=rag_ev.id,
-            call_id=call.id,
-            kind="rag",
-            status="success",
-            title="RAG retrieval",
-            detail=f"{len(rag_snips)} chunks",
-            latency_ms=rag_latency,
-            meta={"chunks": rag_snips},
-        )
-
-        if rag_snips:
+        try:
+            pass_obj.checkpoint("start")
             n = await self._narrate(
                 session,
                 call_id=call.id,
                 text=(
-                    f"I found {len(rag_snips)} related outage or runbook notes. "
-                    f"Top match: {rag_snips[0].split(':')[0][:80]}."
+                    "Starting a fresh MCP agent on your new approach — I'll narrate as I go."
+                    if abort_info
+                    else "On it — I'll troubleshoot this live and keep you posted as I go."
                 ),
-                phase="rag",
+                phase="start",
                 on_progress=on_progress,
+                pass_obj=pass_obj,
             )
-        else:
-            n = await self._narrate(
-                session,
+            narrations.append(n)
+
+            rag_started = time.perf_counter()
+            prompt, rag_snips = self._build_prompt(content, history)
+            rag_latency = (time.perf_counter() - rag_started) * 1000
+            pass_obj.checkpoint("rag")
+            rag_ev = await event_bus.emit(
+                TransactionKind.rag,
+                "RAG retrieval",
+                status="success",
+                detail=f"{len(rag_snips)} chunks",
                 call_id=call.id,
-                text="No close historical match — I'll lean on live status and standard playbooks.",
-                phase="rag",
-                on_progress=on_progress,
-            )
-        narrations.append(n)
-
-        llm_cfgs = await providers_by_kind(session, "llm")
-
-        async def make_slot(cfg):
-            async def _call():
-                return await self._llm_call(cfg, prompt, content)
-
-            label = f"{cfg.provider}:{cfg.model or 'default'}{':fb' if cfg.is_fallback else ''}"
-            return ProviderSlot(name=label, call=_call, is_fallback=cfg.is_fallback, priority=cfg.priority)
-
-        slots = [await make_slot(c) for c in llm_cfgs] or [
-            ProviderSlot(name="demo-llm", call=lambda: self._demo_llm(content), is_fallback=False)
-        ]
-
-        async def on_event(kind: str, payload: dict[str, Any]):
-            status_map = {
-                "attempt": "started",
-                "success": "success",
-                "failed": "failed",
-                "circuit_open": "retry",
-            }
-            status = status_map.get(kind, "info")
-            if payload.get("fallback") and kind == "attempt":
-                status = "fallback"
-            if kind == "attempt" and payload.get("attempt", 1) > 1:
-                status = "retry"
-            if status in {"retry", "fallback"}:
-                reason = "failing over to a backup provider" if status == "fallback" else "retrying the model"
-                nn = await self._narrate(
-                    session,
-                    call_id=call.id,
-                    text=f"Hit a provider snag — {reason}.",
-                    phase=f"llm_{status}",
-                    on_progress=on_progress,
-                )
-                narrations.append(nn)
-            ev = await event_bus.emit(
-                TransactionKind.llm,
-                f"LLM {kind}",
-                status=status,
-                detail=str(payload.get("detail", "")),
-                provider=str(payload.get("provider", "")),
-                call_id=call.id,
-                latency_ms=payload.get("latency_ms"),
-                meta=payload,
+                latency_ms=rag_latency,
+                meta={"chunks": rag_snips, "pass_id": pass_obj.pass_id},
             )
             await self._persist_tx(
                 session,
-                event_id=ev.id,
+                event_id=rag_ev.id,
                 call_id=call.id,
-                kind="llm",
-                status=status,
-                title=f"LLM {kind}",
-                detail=str(payload.get("detail", "")),
-                provider=str(payload.get("provider", "")),
-                latency_ms=payload.get("latency_ms"),
-                meta=payload,
+                kind="rag",
+                status="success",
+                title="RAG retrieval",
+                detail=f"{len(rag_snips)} chunks",
+                latency_ms=rag_latency,
+                meta={"chunks": rag_snips},
             )
 
-        n = await self._narrate(
-            session,
-            call_id=call.id,
-            text="Thinking through the mitigation plan.",
-            phase="llm",
-            on_progress=on_progress,
-        )
-        narrations.append(n)
+            if rag_snips:
+                n = await self._narrate(
+                    session,
+                    call_id=call.id,
+                    text=(
+                        f"I found {len(rag_snips)} related outage or runbook notes. "
+                        f"Top match: {rag_snips[0].split(':')[0][:80]}."
+                    ),
+                    phase="rag",
+                    on_progress=on_progress,
+                    pass_obj=pass_obj,
+                )
+            else:
+                n = await self._narrate(
+                    session,
+                    call_id=call.id,
+                    text="No close historical match — I'll lean on live status and standard playbooks.",
+                    phase="rag",
+                    on_progress=on_progress,
+                    pass_obj=pass_obj,
+                )
+            narrations.append(n)
 
-        try:
-            result = await self.executor.execute(slots, attempts=settings.llm_retry_attempts, on_event=on_event)
-            raw = result.value
-        except Exception as exc:  # noqa: BLE001
-            _ = exc
-            raw = await self._demo_llm(content)
-            nn = await self._narrate(
+            llm_cfgs = await providers_by_kind(session, "llm")
+
+            async def make_slot(cfg):
+                async def _call():
+                    return await self._llm_call(cfg, prompt, content)
+
+                label = f"{cfg.provider}:{cfg.model or 'default'}{':fb' if cfg.is_fallback else ''}"
+                return ProviderSlot(name=label, call=_call, is_fallback=cfg.is_fallback, priority=cfg.priority)
+
+            slots = [await make_slot(c) for c in llm_cfgs] or [
+                ProviderSlot(name="demo-llm", call=lambda: self._demo_llm(content), is_fallback=False)
+            ]
+
+            async def on_event(kind: str, payload: dict[str, Any]):
+                pass_obj.checkpoint("llm")
+                status_map = {
+                    "attempt": "started",
+                    "success": "success",
+                    "failed": "failed",
+                    "circuit_open": "retry",
+                }
+                status = status_map.get(kind, "info")
+                if payload.get("fallback") and kind == "attempt":
+                    status = "fallback"
+                if kind == "attempt" and payload.get("attempt", 1) > 1:
+                    status = "retry"
+                if status in {"retry", "fallback"}:
+                    reason = (
+                        "failing over to a backup provider"
+                        if status == "fallback"
+                        else "retrying the model"
+                    )
+                    nn = await self._narrate(
+                        session,
+                        call_id=call.id,
+                        text=f"Hit a provider snag — {reason}.",
+                        phase=f"llm_{status}",
+                        on_progress=on_progress,
+                        pass_obj=pass_obj,
+                    )
+                    narrations.append(nn)
+                ev = await event_bus.emit(
+                    TransactionKind.llm,
+                    f"LLM {kind}",
+                    status=status,
+                    detail=str(payload.get("detail", "")),
+                    provider=str(payload.get("provider", "")),
+                    call_id=call.id,
+                    latency_ms=payload.get("latency_ms"),
+                    meta={**payload, "pass_id": pass_obj.pass_id},
+                )
+                await self._persist_tx(
+                    session,
+                    event_id=ev.id,
+                    call_id=call.id,
+                    kind="llm",
+                    status=status,
+                    title=f"LLM {kind}",
+                    detail=str(payload.get("detail", "")),
+                    provider=str(payload.get("provider", "")),
+                    latency_ms=payload.get("latency_ms"),
+                    meta=payload,
+                )
+
+            n = await self._narrate(
                 session,
                 call_id=call.id,
-                text="Primary LLM path failed — continuing with the local demo playbook.",
-                phase="llm_fallback",
+                text="Thinking through the mitigation plan.",
+                phase="llm",
                 on_progress=on_progress,
+                pass_obj=pass_obj,
             )
-            narrations.append(nn)
+            narrations.append(n)
 
-        tools_used, tool_narrations = await self._run_actions(
-            session, raw, call.id, on_progress=on_progress
-        )
-        narrations.extend(tool_narrations)
+            try:
+                result = await pass_obj.run(
+                    self.executor.execute(
+                        slots, attempts=settings.llm_retry_attempts, on_event=on_event
+                    )
+                )
+                raw = result.value
+            except PassAborted:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                _ = exc
+                raw = await self._demo_llm(content)
+                nn = await self._narrate(
+                    session,
+                    call_id=call.id,
+                    text="Primary LLM path failed — continuing with the local demo playbook.",
+                    phase="llm_fallback",
+                    on_progress=on_progress,
+                    pass_obj=pass_obj,
+                )
+                narrations.append(nn)
 
-        spoken = self._strip_actions(raw)
-        if not spoken:
-            spoken = "Troubleshooting pass complete."
-        if tools_used:
-            wrap = (
-                "That wraps this pass. You can ask me to verify status, undo a step, or continue."
+            tools_used, tool_narrations = await self._run_actions(
+                session, raw, call.id, on_progress=on_progress, pass_obj=pass_obj
             )
-            chat_content = f"{spoken}\n\nMitigation results:\n- " + "\n- ".join(tools_used)
-        else:
-            wrap = spoken
-            chat_content = spoken
+            narrations.extend(tool_narrations)
 
-        n = await self._narrate(
-            session,
-            call_id=call.id,
-            text=wrap if tools_used else f"Here's my read: {spoken}",
-            phase="wrap",
-            on_progress=on_progress,
-            persist=False,  # final assistant message holds the durable summary
-        )
-        narrations.append(n)
+            spoken = self._strip_actions(raw)
+            if not spoken:
+                spoken = "Troubleshooting pass complete."
+            if tools_used:
+                wrap = (
+                    "That wraps this pass. You can ask me to verify status, undo a step, or continue."
+                )
+                chat_content = f"{spoken}\n\nMitigation results:\n- " + "\n- ".join(tools_used)
+            else:
+                wrap = spoken
+                chat_content = spoken
+
+            n = await self._narrate(
+                session,
+                call_id=call.id,
+                text=wrap if tools_used else f"Here's my read: {spoken}",
+                phase="wrap",
+                on_progress=on_progress,
+                persist=False,
+                pass_obj=pass_obj,
+            )
+            narrations.append(n)
+            await pass_manager.finish(pass_obj, status="completed")
+
+        except PassAborted as exc:
+            aborted = True
+            await cleanup_pass_tools(call.id, pass_id=pass_obj.pass_id)
+            chat_content = (
+                f"Previous approach aborted ({exc.reason}). "
+                "Waiting for — or already starting — your new direction."
+            )
+            # Avoid duplicate abort chatter if a newer pass already owns the call.
+            current = pass_manager.get(call.id)
+            if current is None or current is pass_obj:
+                n = await self._narrate(
+                    session,
+                    call_id=call.id,
+                    text="Stopped the prior MCP agent cleanly. Ready for the new approach.",
+                    phase="aborted",
+                    on_progress=on_progress,
+                    persist=True,
+                )
+                narrations.append(n)
+            await pass_manager.finish(pass_obj, status="aborted")
+            await event_bus.emit(
+                TransactionKind.system,
+                "MCP pass aborted",
+                status="failed",
+                detail=exc.reason,
+                call_id=call.id,
+                meta={"pass_id": pass_obj.pass_id},
+            )
 
         asst = Message(
             call_id=call.id,
             role=MessageRole.assistant.value,
             content=chat_content,
-            meta={"tools": tools_used, "rag": rag_snips, "narrations": narrations},
+            meta={
+                "tools": tools_used,
+                "rag": rag_snips,
+                "narrations": narrations,
+                "pass_id": pass_obj.pass_id,
+                "aborted": aborted,
+                "abort_info": abort_info,
+            },
         )
         session.add(asst)
         await session.commit()
@@ -581,14 +736,13 @@ class AgentService:
 
         await event_bus.emit(
             TransactionKind.chat,
-            "Assistant reply",
-            status="success",
+            "Assistant reply" if not aborted else "Pass aborted",
+            status="success" if not aborted else "failed",
             detail=chat_content[:240],
             call_id=call.id,
         )
 
-        # Simulated STT/TTS/VAD breadcrumbs for hybrid sessions (live TX panel)
-        if channel in {"voice", "hybrid"}:
+        if channel in {"voice", "hybrid"} and not aborted:
             vad = (await providers_by_kind(session, "vad") or [None])[0]
             stt = (await providers_by_kind(session, "stt") or [None])[0]
             tts = (await providers_by_kind(session, "tts") or [None])[0]
@@ -624,6 +778,9 @@ class AgentService:
             "rag_context": rag_snips,
             "tools_used": tools_used,
             "narrations": narrations,
+            "aborted": aborted,
+            "abort_info": abort_info,
+            "pass_id": pass_obj.pass_id,
         }
 
 

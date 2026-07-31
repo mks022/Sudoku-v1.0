@@ -146,6 +146,25 @@ export function ConsoleChat({
           } catch {
             /* browser TTS already covers narration text */
           }
+        } else if (msg.type === "pass_aborted" || msg.type === "abort_ack") {
+          if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+          setPhase("aborted");
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: Date.now(),
+              call_id: id,
+              role: "assistant",
+              content:
+                msg.text ||
+                "Prior MCP approach aborted — tool threads closed. Starting the new direction.",
+              created_at: new Date().toISOString(),
+              meta: { narration: true, phase: "abort", abort_info: msg.abort_info },
+            },
+          ]);
+          if (speakLive) {
+            speakText("Aborting the current approach and closing MCP threads.");
+          }
         } else if (msg.type === "assistant_text") {
           setMessages((prev) => [
             ...prev,
@@ -191,14 +210,25 @@ export function ConsoleChat({
       setBusy(true);
       setPhase("start");
 
-      // Prefer voice/hybrid WS so narrations stream with optional provider TTS
+      // Prefer voice/hybrid WS so narrations stream; abort prior MCP pass if busy
       const ws = voiceWsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "chat", text: trimmed }));
+        if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+        ws.send(
+          JSON.stringify({
+            type: busy ? "abort_and_chat" : "chat",
+            text: trimmed,
+            reason: busy ? "operator_new_approach" : "operator_message",
+          })
+        );
         return;
       }
 
-      const res = await api.chat(trimmed, id, "hybrid");
+      if (busy && "speechSynthesis" in window) window.speechSynthesis.cancel();
+      const res = await api.chat(trimmed, id, "hybrid", {
+        abort_current: true,
+        supersede_reason: busy ? "operator_new_approach" : "operator_message",
+      });
       setCallId(res.call_id);
       setMessages((prev) => {
         const withoutOpt = prev.filter((m) => m.id !== optimistic.id);
@@ -375,11 +405,42 @@ export function ConsoleChat({
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder={busy ? "Keep talking — ask a follow-up mid-troubleshoot…" : "Type a mitigation request…"}
+          placeholder={
+            busy
+              ? "Suggest a different approach — current MCP pass will abort cleanly…"
+              : "Type a mitigation request…"
+          }
         />
         <button className="btn btn-primary" type="submit" disabled={!input.trim()}>
-          {busy ? "Send anyway" : "Send"}
+          {busy ? "Abort & apply" : "Send"}
         </button>
+        {busy && callId && (
+          <button
+            className="btn btn-ghost"
+            type="button"
+            onClick={() => {
+              if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+              void api.abortPass(callId, "operator_abort").then(() => {
+                setBusy(false);
+                setPhase("");
+                setMessages((prev) => [
+                  ...prev,
+                  {
+                    id: Date.now(),
+                    call_id: callId,
+                    role: "assistant",
+                    content: "MCP pass aborted on request. Tool threads closed.",
+                    created_at: new Date().toISOString(),
+                    meta: { narration: true, phase: "abort" },
+                  },
+                ]);
+              });
+              voiceWsRef.current?.send(JSON.stringify({ type: "abort", reason: "operator_abort" }));
+            }}
+          >
+            Abort
+          </button>
+        )}
         <button className="btn btn-ghost" type="button" onClick={() => void endSession()} disabled={!callId}>
           End
         </button>

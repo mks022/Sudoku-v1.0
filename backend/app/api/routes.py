@@ -22,6 +22,7 @@ from app.models.schemas import (
     RagDocumentOut,
     SessionStart,
     TransactionEvent,
+    TransactionKind,
 )
 from app.pipeline.voice import handle_voice_ws, pipeline_info
 from app.rag.index import load_rag_from_db, rag_index
@@ -216,7 +217,12 @@ async def end_call(call_id: int, session: AsyncSession = Depends(get_session)):
 async def chat(payload: MessageIn, session: AsyncSession = Depends(get_session)):
     try:
         result = await agent_service.handle_chat(
-            session, content=payload.content, call_id=payload.call_id, channel=payload.channel
+            session,
+            content=payload.content,
+            call_id=payload.call_id,
+            channel=payload.channel,
+            abort_current=payload.abort_current,
+            supersede_reason=payload.supersede_reason,
         )
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
@@ -242,8 +248,37 @@ async def chat(payload: MessageIn, session: AsyncSession = Depends(get_session))
         rag_context=result["rag_context"],
         tools_used=result["tools_used"],
         narrations=result.get("narrations") or [],
+        aborted=bool(result.get("aborted")),
+        abort_info=result.get("abort_info"),
+        pass_id=str(result.get("pass_id") or ""),
         transactions=event_bus.history()[-20:],
     )
+
+
+@router.post("/calls/{call_id}/abort")
+async def abort_pass(call_id: int, reason: str = "operator_abort"):
+    from app.mcp_tools.network import cleanup_pass_tools
+    from app.services.pass_manager import pass_manager
+
+    info = await pass_manager.abort(call_id, reason=reason, wait=True)
+    cleanup = await cleanup_pass_tools(call_id)
+    info["mcp_cleanup"] = cleanup
+    await event_bus.emit(
+        TransactionKind.system,
+        "Operator abort",
+        status="info" if info.get("aborted") else "info",
+        detail=reason,
+        call_id=call_id,
+        meta=info,
+    )
+    return info
+
+
+@router.get("/calls/{call_id}/pass")
+async def pass_status(call_id: int):
+    from app.services.pass_manager import pass_manager
+
+    return pass_manager.status(call_id)
 
 
 @router.get("/transactions", response_model=list[TransactionEvent])

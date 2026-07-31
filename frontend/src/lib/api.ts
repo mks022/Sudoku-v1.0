@@ -116,7 +116,7 @@ export const api = {
     end: (id: number) => request<CallRecord>(`/calls/${id}/end`, { method: "POST" }),
     messages: (id: number) => request<Message[]>(`/calls/${id}/messages`),
   },
-  chat: (content: string, call_id?: number | null, channel = "hybrid") =>
+  chat: (content: string, call_id?: number | null, channel = "hybrid", opts?: { abort_current?: boolean; supersede_reason?: string }) =>
     request<{
       call_id: number;
       user_message: Message;
@@ -124,10 +124,25 @@ export const api = {
       rag_context: string[];
       tools_used: string[];
       narrations?: Array<{ phase: string; text: string; speak?: boolean }>;
+      aborted?: boolean;
+      abort_info?: Record<string, unknown>;
+      pass_id?: string;
     }>("/chat", {
       method: "POST",
-      body: JSON.stringify({ content, call_id, channel }),
+      body: JSON.stringify({
+        content,
+        call_id,
+        channel,
+        abort_current: opts?.abort_current ?? true,
+        supersede_reason: opts?.supersede_reason ?? "operator_new_approach",
+      }),
     }),
+  abortPass: (callId: number, reason = "operator_abort") =>
+    request<Record<string, unknown>>(`/calls/${callId}/abort?reason=${encodeURIComponent(reason)}`, {
+      method: "POST",
+    }),
+  passStatus: (callId: number) =>
+    request<{ active: boolean; pass_id?: string; phase?: string }>(`/calls/${callId}/pass`),
   transactions: () => request<TransactionEvent[]>("/transactions"),
   rag: {
     list: () => request<RagDocument[]>("/rag/documents"),

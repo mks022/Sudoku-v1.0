@@ -208,6 +208,92 @@ async def invoke_tool(name: str, **kwargs: Any) -> ToolResult:
     return await fn(**kwargs)
 
 
+# In-flight MCP tool tasks keyed by (call_id, pass_id) for graceful abort.
+_inflight_tools: dict[tuple[int, str], set[asyncio.Task]] = {}
+
+
+async def invoke_tool_tracked(
+    call_id: int | None,
+    name: str,
+    *,
+    pass_id: str | None = None,
+    **kwargs: Any,
+) -> ToolResult:
+    """Run an MCP tool as a cancellable task bound to a call/pass."""
+    if call_id is None:
+        return await invoke_tool(name, **kwargs)
+
+    async def _run() -> ToolResult:
+        return await invoke_tool(name, **kwargs)
+
+    task = asyncio.create_task(_run())
+    key = (call_id, pass_id or "")
+    bucket = _inflight_tools.setdefault(key, set())
+    bucket.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        bucket.discard(t)
+        if not bucket:
+            _inflight_tools.pop(key, None)
+
+    task.add_done_callback(_done)
+    try:
+        return await task
+    except asyncio.CancelledError:
+        return ToolResult(
+            name=name,
+            ok=False,
+            summary=f"Tool {name} aborted before completion",
+            data={"aborted": True},
+        )
+
+
+async def cleanup_pass_tools(
+    call_id: int,
+    *,
+    pass_id: str | None = None,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Cancel and join in-flight MCP tool tasks for a call (optionally one pass)."""
+    if pass_id is not None:
+        keys = [(call_id, pass_id)]
+    else:
+        keys = [k for k in list(_inflight_tools) if k[0] == call_id]
+
+    tasks: list[asyncio.Task] = []
+    for key in keys:
+        tasks.extend(list(_inflight_tools.get(key, set())))
+
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+    closed = 0
+    timed_out = False
+    if tasks:
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        closed = len(done)
+        if pending:
+            timed_out = True
+            for t in pending:
+                t.cancel()
+            await asyncio.wait(pending, timeout=1.0)
+    for key in keys:
+        _inflight_tools.pop(key, None)
+    _log(
+        "cleanup_pass_tools",
+        f"Closed MCP tools for call {call_id} pass={pass_id}",
+        call_id=call_id,
+        closed=closed,
+    )
+    return {
+        "call_id": call_id,
+        "pass_id": pass_id,
+        "tools_closed": closed,
+        "tools_total": len(tasks),
+        "timed_out": timed_out,
+    }
+
+
 def tools_prompt_block() -> str:
     lines = ["Available MCP network mitigation tools:"]
     for t in TOOL_SPECS:
@@ -215,6 +301,7 @@ def tools_prompt_block() -> str:
     lines.append(
         "When mitigation is needed, respond with a JSON action block on its own line:\n"
         'ACTION: {"tool":"tool_name","args":{...}}\n'
-        "You may emit multiple ACTION lines. Then explain the plan briefly to the operator."
+        "You may emit multiple ACTION lines. Then explain the plan briefly to the operator.\n"
+        "If the operator changes approach mid-pass, stop the current tool plan and follow the new direction."
     )
     return "\n".join(lines)

@@ -83,6 +83,10 @@ class MessageIn(BaseModel):
     content: str
     call_id: Optional[int] = None
     channel: str = "chat"
+    # When true (default), gracefully abort any in-flight MCP pass on this call
+    # before starting a new troubleshooting agent for this message.
+    abort_current: bool = True
+    supersede_reason: str = "operator_new_approach"
 
 
 class MessageOut(BaseModel):
@@ -144,4 +148,7 @@ class ChatReply(BaseModel):
     rag_context: list[str] = Field(default_factory=list)
     tools_used: list[str] = Field(default_factory=list)
     narrations: list[dict[str, Any]] = Field(default_factory=list)
+    aborted: bool = False
+    abort_info: Optional[dict[str, Any]] = None
+    pass_id: str = ""
     transactions: list[TransactionEvent] = Field(default_factory=list)

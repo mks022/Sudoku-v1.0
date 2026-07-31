@@ -8,6 +8,7 @@ When API keys are missing, the HTTP chat path remains fully usable (demo LLM).
 Voice WebSocket sessions stream PCM frames and mirror live transactions.
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -15,9 +16,11 @@ from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.mcp_tools.network import cleanup_pass_tools
 from app.models.schemas import TransactionKind
 from app.services.agent import agent_service
 from app.services.events import event_bus
+from app.services.pass_manager import pass_manager
 from app.services.providers import providers_by_kind
 
 logger = logging.getLogger(__name__)
@@ -39,9 +42,43 @@ class VoiceSession:
         self.websocket = websocket
         self.active = True
         self._audio_buffer = bytearray()
+        self._run_task: asyncio.Task | None = None
 
     async def send_json(self, payload: dict[str, Any]) -> None:
         await self.websocket.send_json(payload)
+
+    async def cancel_active_run(self, reason: str = "operator_new_approach") -> dict[str, Any]:
+        """Gracefully stop the in-flight MCP agent + child tasks for this call."""
+        info = await pass_manager.abort(self.call_id, reason=reason, wait=True)
+        tool_cleanup = await cleanup_pass_tools(
+            self.call_id, pass_id=info.get("pass_id") if info.get("aborted") else None
+        )
+        info["mcp_cleanup"] = tool_cleanup
+        task = self._run_task
+        if task and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=6.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):  # noqa: BLE001
+                pass
+        self._run_task = None
+        await self.send_json(
+            {
+                "type": "pass_aborted",
+                "call_id": self.call_id,
+                "reason": reason,
+                "abort_info": info,
+            }
+        )
+        return info
+
+    def spawn(self, coro) -> asyncio.Task:
+        """Replace any running pass task with a new one."""
+        if self._run_task and not self._run_task.done():
+            self._run_task.cancel()
+        task = asyncio.create_task(coro)
+        self._run_task = task
+        return task
 
     async def on_audio_chunk(self, pcm_b64: str, session: AsyncSession) -> None:
         vad_cfgs = await providers_by_kind(session, "vad")
@@ -168,7 +205,19 @@ class VoiceSession:
             call_id=self.call_id,
             channel="voice",
             on_progress=on_progress,
+            abort_current=True,
+            supersede_reason="operator_new_approach",
         )
+        if result.get("aborted"):
+            await self.send_json(
+                {
+                    "type": "pass_aborted",
+                    "call_id": self.call_id,
+                    "abort_info": result.get("abort_info"),
+                    "text": result["assistant_message"].content,
+                }
+            )
+            return
         reply = result["assistant_message"].content
         await self.send_json(
             {
@@ -178,7 +227,7 @@ class VoiceSession:
                 "tools": result["tools_used"],
                 "rag": result["rag_context"],
                 "narrations": result.get("narrations") or [],
-                # Final bubble is textual summary; step TTS already played.
+                "pass_id": result.get("pass_id"),
                 "speak": False,
             }
         )
@@ -239,46 +288,91 @@ async def handle_voice_ws(websocket: Any, session_factory, call_id: int) -> None
             raw = await websocket.receive_text()
             msg = json.loads(raw)
             mtype = msg.get("type")
-            async with session_factory() as session:
-                if mtype == "audio":
-                    await voice.on_audio_chunk(msg.get("data", ""), session)
-                elif mtype == "utterance_end":
-                    await voice.on_utterance_end(session, transcript=msg.get("transcript"))
-                elif mtype == "chat":
-                    async def on_progress(item: dict[str, Any]) -> None:
+
+            if mtype == "ping":
+                await voice.send_json({"type": "pong"})
+                continue
+            if mtype == "close":
+                await voice.cancel_active_run(reason="session_close")
+                voice.active = False
+                continue
+            if mtype == "abort":
+                info = await voice.cancel_active_run(
+                    reason=str(msg.get("reason") or "operator_abort")
+                )
+                await voice.send_json({"type": "abort_ack", "abort_info": info})
+                continue
+
+            if mtype in {"chat", "abort_and_chat"}:
+                text = msg.get("text", "")
+                reason = str(msg.get("reason") or "operator_new_approach")
+
+                async def run_chat(
+                    chat_text: str,
+                    channel: str = "hybrid",
+                    supersede_reason: str = reason,
+                ) -> None:
+                    async with session_factory() as session:
+                        async def on_progress(item: dict[str, Any]) -> None:
+                            await voice.send_json(
+                                {
+                                    "type": "narration",
+                                    "call_id": call_id,
+                                    "phase": item.get("phase"),
+                                    "text": item.get("text"),
+                                    "speak": True,
+                                    "message_id": item.get("message_id"),
+                                    "pass_id": item.get("pass_id"),
+                                }
+                            )
+
+                        result = await agent_service.handle_chat(
+                            session,
+                            content=chat_text,
+                            call_id=call_id,
+                            channel=channel,
+                            on_progress=on_progress,
+                            abort_current=True,
+                            supersede_reason=supersede_reason,
+                        )
+                        if result.get("aborted"):
+                            await voice.send_json(
+                                {
+                                    "type": "pass_aborted",
+                                    "call_id": call_id,
+                                    "abort_info": result.get("abort_info"),
+                                    "text": result["assistant_message"].content,
+                                }
+                            )
+                            return
                         await voice.send_json(
                             {
-                                "type": "narration",
+                                "type": "assistant_text",
                                 "call_id": call_id,
-                                "phase": item.get("phase"),
-                                "text": item.get("text"),
-                                "speak": True,
-                                "message_id": item.get("message_id"),
+                                "text": result["assistant_message"].content,
+                                "tools": result["tools_used"],
+                                "rag": result["rag_context"],
+                                "narrations": result.get("narrations") or [],
+                                "pass_id": result.get("pass_id"),
+                                "speak": False,
                             }
                         )
 
-                    result = await agent_service.handle_chat(
-                        session,
-                        content=msg.get("text", ""),
-                        call_id=call_id,
-                        channel="hybrid",
-                        on_progress=on_progress,
-                    )
-                    await voice.send_json(
-                        {
-                            "type": "assistant_text",
-                            "call_id": call_id,
-                            "text": result["assistant_message"].content,
-                            "tools": result["tools_used"],
-                            "rag": result["rag_context"],
-                            "narrations": result.get("narrations") or [],
-                            "speak": False,
-                        }
-                    )
-                elif mtype == "ping":
-                    await voice.send_json({"type": "pong"})
-                elif mtype == "close":
-                    voice.active = False
+                if mtype == "abort_and_chat" or pass_manager.is_active(call_id):
+                    await voice.cancel_active_run(reason=reason)
+                voice.spawn(run_chat(text, "hybrid", reason))
+            elif mtype == "utterance_end":
+                if pass_manager.is_active(call_id):
+                    await voice.cancel_active_run(reason="operator_new_approach")
+
+                async def run_utterance() -> None:
+                    async with session_factory() as session:
+                        await voice.on_utterance_end(session, transcript=msg.get("transcript"))
+
+                voice.spawn(run_utterance())
+            elif mtype == "audio":
+                async with session_factory() as session:
+                    await voice.on_audio_chunk(msg.get("data", ""), session)
     except Exception as exc:  # noqa: BLE001
         logger.exception("voice ws error: %s", exc)
         try:
@@ -286,6 +380,7 @@ async def handle_voice_ws(websocket: Any, session_factory, call_id: int) -> None
         except Exception:  # noqa: BLE001
             pass
     finally:
+        await voice.cancel_active_run(reason="session_close")
         async with session_factory() as session:
             try:
                 await agent_service.end_call(session, call_id)
