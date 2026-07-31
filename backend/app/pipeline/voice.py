@@ -44,11 +44,13 @@ class VoiceSession:
         await self.websocket.send_json(payload)
 
     async def on_audio_chunk(self, pcm_b64: str, session: AsyncSession) -> None:
+        vad_cfgs = await providers_by_kind(session, "vad")
+        vad_name = vad_cfgs[0].provider if vad_cfgs else "unconfigured"
         await event_bus.emit(
             TransactionKind.vad,
             "Audio frame received",
             status="info",
-            provider="silero",
+            provider=vad_name,
             call_id=self.call_id,
             detail=f"{len(pcm_b64)} b64 chars",
         )
@@ -69,25 +71,29 @@ class VoiceSession:
         # For continuous streams we keep buffering until end signal.
 
     async def on_utterance_end(self, session: AsyncSession, transcript: Optional[str] = None) -> None:
+        vad_cfgs = await providers_by_kind(session, "vad")
         await event_bus.emit(
             TransactionKind.vad,
             "End of utterance",
             status="success",
-            provider="silero",
+            provider=(vad_cfgs[0].provider if vad_cfgs else "unconfigured"),
             call_id=self.call_id,
         )
 
         text = transcript
         if not text:
-            # Without live STT credentials, accept client-side or empty
             stt_cfgs = await providers_by_kind(session, "stt")
             primary = next((c for c in stt_cfgs if not c.is_fallback), None)
-            if primary and primary.api_key and self._audio_buffer:
+            needs_key = True
+            if primary:
+                auth = str((primary.extra or {}).get("auth_scheme") or "bearer").lower()
+                needs_key = auth not in {"none"}
+            if primary and self._audio_buffer and (primary.api_key or not needs_key):
                 text = await self._transcribe(primary, bytes(self._audio_buffer))
             else:
                 await event_bus.emit(
                     TransactionKind.stt,
-                    "STT skipped — no key or empty audio",
+                    "STT skipped — no provider/key or empty audio",
                     status="info",
                     provider=(primary.provider if primary else "none"),
                     call_id=self.call_id,
@@ -123,7 +129,11 @@ class VoiceSession:
         tts_cfgs = await providers_by_kind(session, "tts")
         tts = next((c for c in tts_cfgs if c.enabled), None)
         audio_b64 = None
-        if tts and tts.api_key:
+        can_tts = False
+        if tts:
+            auth = str((tts.extra or {}).get("auth_scheme") or "bearer").lower()
+            can_tts = bool(tts.api_key) or auth == "none"
+        if tts and can_tts:
             try:
                 audio_b64 = await self._synthesize(tts, reply)
                 await event_bus.emit(
@@ -145,7 +155,7 @@ class VoiceSession:
         else:
             await event_bus.emit(
                 TransactionKind.tts,
-                "TTS text-only (no API key)",
+                "TTS text-only (no provider/key)",
                 status="info",
                 call_id=self.call_id,
             )
@@ -161,7 +171,7 @@ class VoiceSession:
         )
 
     async def _transcribe(self, cfg, audio: bytes) -> str:
-        import httpx
+        from app.services.adapters import call_stt
 
         await event_bus.emit(
             TransactionKind.stt,
@@ -170,70 +180,22 @@ class VoiceSession:
             provider=cfg.provider,
             call_id=self.call_id,
         )
-        if cfg.provider == "openai":
-            headers = {"Authorization": f"Bearer {cfg.api_key}"}
-            base = (cfg.base_url or "https://api.openai.com/v1").rstrip("/")
-            files = {"file": ("audio.wav", audio, "audio/wav")}
-            data = {"model": cfg.model or "whisper-1"}
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(
-                    f"{base}/audio/transcriptions", headers=headers, data=data, files=files
-                )
-                resp.raise_for_status()
-                return resp.json().get("text", "")
-        # Deepgram
-        headers = {
-            "Authorization": f"Token {cfg.api_key}",
-            "Content-Type": "audio/wav",
-        }
-        base = (cfg.base_url or "https://api.deepgram.com").rstrip("/")
-        model = cfg.model or "nova-2"
-        async with httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                f"{base}/v1/listen?model={model}&smart_format=true",
-                headers=headers,
-                content=audio,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return (
-                data.get("results", {})
-                .get("channels", [{}])[0]
-                .get("alternatives", [{}])[0]
-                .get("transcript", "")
-            )
+        return await call_stt(cfg, audio)
 
     async def _synthesize(self, cfg, text: str) -> str:
-        import httpx
+        from app.services.adapters import call_tts
 
-        if cfg.provider == "openai":
-            headers = {
-                "Authorization": f"Bearer {cfg.api_key}",
-                "Content-Type": "application/json",
-            }
-            base = (cfg.base_url or "https://api.openai.com/v1").rstrip("/")
-            body = {
-                "model": cfg.model or "gpt-4o-mini-tts",
-                "voice": (cfg.extra or {}).get("voice", "alloy"),
-                "input": text[:4000],
-            }
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(f"{base}/audio/speech", headers=headers, json=body)
-                resp.raise_for_status()
-                return base64.b64encode(resp.content).decode("ascii")
-
-        # Cartesia-style placeholder: if not OpenAI, skip binary and raise
-        raise RuntimeError(f"TTS provider {cfg.provider} requires additional SDK wiring")
+        return await call_tts(cfg, text)
 
 
 def pipeline_info() -> dict[str, Any]:
     return {
         "pipecat_installed": PIPECAT_AVAILABLE,
-        "stages": ["transport", "vad(silero)", "stt", "llm+rag+mcp", "tts", "transport"],
+        "stages": ["transport", "vad", "stt", "llm+rag+mcp", "tts", "transport"],
         "resilience": ["retry", "circuit_breaker", "provider_fallback", "text_degrade"],
         "note": (
-            "Voice WebSocket accepts audio chunks + utterance_end. "
-            "Chat path always available. Configure provider API keys in the frontend."
+            "Providers are protocol-driven and fully user-configured. "
+            "Voice WebSocket accepts audio chunks + utterance_end; chat always available."
         ),
     }
 

@@ -7,18 +7,11 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
-class ProviderKind(str, Enum):
-    llm = "llm"
-    stt = "stt"
-    tts = "tts"
-    vad = "vad"
-    mcp = "mcp"
-
-
 class ProviderConfigIn(BaseModel):
-    kind: ProviderKind
-    provider: str
+    kind: str = Field(..., min_length=1, max_length=64, description="Free-form kind, e.g. llm/stt/tts/vad/mcp")
+    provider: str = Field(..., min_length=1, max_length=128, description="Any provider label")
     api_key: str = ""
+    clear_api_key: bool = False
     base_url: str = ""
     model: str = ""
     extra: dict[str, Any] = Field(default_factory=dict)
@@ -27,11 +20,32 @@ class ProviderConfigIn(BaseModel):
     priority: int = 0
 
 
-class ProviderConfigOut(ProviderConfigIn):
+class ProviderConfigOut(BaseModel):
     id: int
+    kind: str
+    provider: str
+    api_key: str = ""
     api_key_masked: str = ""
+    base_url: str = ""
+    model: str = ""
+    extra: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+    is_fallback: bool = False
+    priority: int = 0
     updated_at: datetime
+    protocol: str = ""
 
+
+class ProviderTemplateApply(BaseModel):
+    template_id: str
+    api_key: str = ""
+    enabled: bool = True
+    is_fallback: bool = False
+    priority: int = 0
+    provider: str = ""
+    base_url: str = ""
+    model: str = ""
+    extra: dict[str, Any] = Field(default_factory=dict)
 
 class CallStatus(str, Enum):
     active = "active"

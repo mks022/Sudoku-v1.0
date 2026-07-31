@@ -5,7 +5,6 @@ import re
 import time
 from typing import Any, Optional
 
-import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -18,7 +17,6 @@ from app.rag.index import rag_index
 from app.resilience.executor import ProviderSlot, ResilientExecutor
 from app.services.events import event_bus
 from app.services.providers import providers_by_kind
-
 SYSTEM_PROMPT = """You are NetGuard, a network fault mitigation voice/chat agent.
 You help operators diagnose and mitigate network incidents using live status,
 historical outages, and MCP mitigation tools.
@@ -136,26 +134,16 @@ class AgentService:
         )
         return prompt, [f"{c.title}: {c.content[:240]}" for c in chunks]
 
-    async def _llm_openai(self, cfg, prompt: str, user_text: str) -> str:
-        if not cfg.api_key:
-            return await self._demo_llm(user_text)
+    async def _llm_call(self, cfg, prompt: str, user_text: str) -> str:
+        from app.services.adapters import call_llm
 
-        headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
-        base = (cfg.base_url or "https://api.openai.com/v1").rstrip("/")
-        body = {
-            "model": cfg.model or "gpt-4o-mini",
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.3,
-        }
-        async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as client:
-            resp = await client.post(f"{base}/chat/completions", headers=headers, json=body)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
-
+        return await call_llm(
+            cfg,
+            system=SYSTEM_PROMPT,
+            prompt=prompt,
+            user_text=user_text,
+            demo_fn=self._demo_llm,
+        )
     async def _demo_llm(self, user_text: str) -> str:
         """Offline-capable demo brain when no LLM API key is configured."""
         lower = user_text.lower()
@@ -188,7 +176,7 @@ class AgentService:
             )
             reply_parts.append("DNS timeouts match the 2025 resolver incident. Pinning critical hostnames.")
         if any(k in lower for k in ("stt", "tts", "429", "503")) or "provider" in lower:
-            actions.append({"tool": "open_provider_circuit", "args": {"provider": "deepgram", "open_": True}})
+            actions.append({"tool": "open_provider_circuit", "args": {"provider": "primary-stt", "open_": True}})
             reply_parts.append("Opening the primary STT circuit and failing over to the secondary provider.")
         if any(k in lower for k in ("fiber", "cut")) or (
             "dfw" in lower and "bgp" not in lower and "flap" not in lower
@@ -329,7 +317,7 @@ class AgentService:
 
         async def make_slot(cfg):
             async def _call():
-                return await self._llm_openai(cfg, prompt, content)
+                return await self._llm_call(cfg, prompt, content)
 
             label = f"{cfg.provider}:{cfg.model or 'default'}{':fb' if cfg.is_fallback else ''}"
             return ProviderSlot(name=label, call=_call, is_fallback=cfg.is_fallback, priority=cfg.priority)
@@ -409,11 +397,14 @@ class AgentService:
 
         # Simulated STT/TTS/VAD breadcrumbs for hybrid sessions (live TX panel)
         if channel in {"voice", "hybrid"}:
+            vad = (await providers_by_kind(session, "vad") or [None])[0]
+            stt = (await providers_by_kind(session, "stt") or [None])[0]
+            tts = (await providers_by_kind(session, "tts") or [None])[0]
             await event_bus.emit(
                 TransactionKind.vad,
                 "VAD speech segment",
                 status="success",
-                provider="silero",
+                provider=(vad.provider if vad else "unconfigured"),
                 call_id=call.id,
                 detail="end-of-utterance",
             )
@@ -421,7 +412,7 @@ class AgentService:
                 TransactionKind.stt,
                 "STT transcript",
                 status="success",
-                provider="configured-primary",
+                provider=(stt.provider if stt else "unconfigured"),
                 call_id=call.id,
                 detail=content[:120],
             )
@@ -429,7 +420,7 @@ class AgentService:
                 TransactionKind.tts,
                 "TTS synthesis",
                 status="success",
-                provider="configured-primary",
+                provider=(tts.provider if tts else "unconfigured"),
                 call_id=call.id,
                 detail=f"{len(spoken)} chars",
             )

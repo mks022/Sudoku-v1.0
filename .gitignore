@@ -8,6 +8,7 @@ backend/data/*.db
 backend/data/**/*.db
 node_modules/
 frontend/dist/
+*.tsbuildinfo
 .env
 .DS_Store
 *.log

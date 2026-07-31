@@ -17,7 +17,7 @@ from app.models.schemas import (
     MessageRole,
     ProviderConfigIn,
     ProviderConfigOut,
-    ProviderKind,
+    ProviderTemplateApply,
     RagDocumentIn,
     RagDocumentOut,
     SessionStart,
@@ -26,8 +26,10 @@ from app.models.schemas import (
 from app.pipeline.voice import handle_voice_ws, pipeline_info
 from app.rag.index import load_rag_from_db, rag_index
 from app.services.agent import agent_service
+from app.services.adapters import TEMPLATES, catalog, resolve_protocol
 from app.services.events import event_bus
 from app.services.providers import (
+    create_from_template,
     delete_provider,
     list_providers,
     mask_key,
@@ -72,7 +74,7 @@ def call_to_out(call) -> CallOut:
 def provider_to_out(row) -> ProviderConfigOut:
     return ProviderConfigOut(
         id=row.id,
-        kind=ProviderKind(row.kind),
+        kind=row.kind,
         provider=row.provider,
         api_key="",
         api_key_masked=mask_key(row.api_key or ""),
@@ -83,6 +85,7 @@ def provider_to_out(row) -> ProviderConfigOut:
         is_fallback=row.is_fallback,
         priority=row.priority,
         updated_at=row.updated_at or datetime.utcnow(),
+        protocol=resolve_protocol(row),
     )
 
 
@@ -101,8 +104,13 @@ async def get_pipeline():
     return pipeline_info()
 
 
+@router.get("/providers/catalog")
+async def providers_catalog():
+    return catalog()
+
+
 @router.get("/providers", response_model=list[ProviderConfigOut])
-async def get_providers(kind: ProviderKind | None = None, session: AsyncSession = Depends(get_session)):
+async def get_providers(kind: str | None = None, session: AsyncSession = Depends(get_session)):
     rows = await list_providers(session, kind)
     return [provider_to_out(r) for r in rows]
 
@@ -110,6 +118,32 @@ async def get_providers(kind: ProviderKind | None = None, session: AsyncSession 
 @router.post("/providers", response_model=ProviderConfigOut)
 async def create_provider(payload: ProviderConfigIn, session: AsyncSession = Depends(get_session)):
     row = await upsert_provider(session, payload)
+    return provider_to_out(row)
+
+
+@router.post("/providers/from-template", response_model=ProviderConfigOut)
+async def provider_from_template(payload: ProviderTemplateApply, session: AsyncSession = Depends(get_session)):
+    template = next((t for t in TEMPLATES if t["id"] == payload.template_id), None)
+    if not template:
+        raise HTTPException(404, f"Unknown template `{payload.template_id}`")
+    overrides: dict = {}
+    if payload.provider:
+        overrides["provider"] = payload.provider
+    if payload.base_url:
+        overrides["base_url"] = payload.base_url
+    if payload.model:
+        overrides["model"] = payload.model
+    if payload.extra:
+        overrides["extra"] = {**(template.get("extra") or {}), **payload.extra}
+    row = await create_from_template(
+        session,
+        template,
+        api_key=payload.api_key,
+        enabled=payload.enabled,
+        is_fallback=payload.is_fallback,
+        priority=payload.priority,
+        overrides=overrides,
+    )
     return provider_to_out(row)
 
 

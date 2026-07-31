@@ -1,10 +1,8 @@
 const API_BASE = import.meta.env.VITE_API_BASE || "/api";
 
-export type ProviderKind = "llm" | "stt" | "tts" | "vad" | "mcp";
-
 export interface ProviderConfig {
   id: number;
-  kind: ProviderKind;
+  kind: string;
   provider: string;
   api_key: string;
   api_key_masked: string;
@@ -15,6 +13,23 @@ export interface ProviderConfig {
   is_fallback: boolean;
   priority: number;
   updated_at: string;
+  protocol?: string;
+}
+
+export interface ProviderCatalog {
+  suggested_kinds: string[];
+  protocols: Array<{ id: string; kinds: string[]; label: string }>;
+  templates: Array<{
+    id: string;
+    label: string;
+    kind: string;
+    provider: string;
+    base_url: string;
+    model: string;
+    extra: Record<string, unknown>;
+  }>;
+  auth_schemes: string[];
+  note: string;
 }
 
 export interface CallRecord {
@@ -76,11 +91,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<{ ok: boolean; pipeline: Record<string, unknown>; rag_docs: number }>("/health"),
   providers: {
-    list: () => request<ProviderConfig[]>("/providers"),
-    create: (body: Partial<ProviderConfig>) =>
+    list: (kind?: string) =>
+      request<ProviderConfig[]>(kind ? `/providers?kind=${encodeURIComponent(kind)}` : "/providers"),
+    catalog: () => request<ProviderCatalog>("/providers/catalog"),
+    create: (body: Record<string, unknown>) =>
       request<ProviderConfig>("/providers", { method: "POST", body: JSON.stringify(body) }),
-    update: (id: number, body: Partial<ProviderConfig>) =>
+    update: (id: number, body: Record<string, unknown>) =>
       request<ProviderConfig>(`/providers/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+    fromTemplate: (body: Record<string, unknown>) =>
+      request<ProviderConfig>("/providers/from-template", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
     remove: (id: number) => request<{ ok: boolean }>(`/providers/${id}`, { method: "DELETE" }),
   },
   calls: {

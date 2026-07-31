@@ -52,7 +52,7 @@ npm run dev
 
 UI: http://127.0.0.1:5173
 
-1. Open **Providers** and paste API keys (OpenAI / Deepgram / Cartesia, etc.)
+1. Open **Providers** — add an optional template or a fully custom slot (any kind, protocol, base URL, auth)
 2. Open **Console**, type `status` or `BGP flap at AMS-1`, or use **Mic**
 3. Watch **Live transactions** and **Network plane** update
 4. Review **Calls** for history
@@ -61,12 +61,12 @@ UI: http://127.0.0.1:5173
 
 | Stage | Role |
 |-------|------|
-| VAD (Silero) | Speech segment / end-of-utterance |
-| STT | Deepgram primary, OpenAI Whisper fallback |
+| VAD | Configured VAD provider (protocol: local) |
+| STT | Protocol-driven (openai_transcriptions, deepgram_listen, http_binary, …) |
 | RAG | TF-IDF over outage files + manual docs |
-| LLM | OpenAI-compatible chat; demo brain without keys |
-| MCP | In-process network mitigation tools |
-| TTS | Cartesia / OpenAI; browser speechSynthesis fallback |
+| LLM | Protocol-driven (openai_chat, anthropic_messages, http_json, demo, …) |
+| MCP | Builtin or custom MCP slots |
+| TTS | Protocol-driven (openai_speech, http_binary, …) |
 | Resilience | Tenacity retries, circuit breaker, provider failover, text degrade |
 
 ## Environment
