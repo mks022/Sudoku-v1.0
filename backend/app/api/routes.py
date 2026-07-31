@@ -4,6 +4,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import attributes
 
 from app.models.db import SessionLocal, RagDocument
 from app.models.schemas import (
@@ -45,9 +46,12 @@ async def get_session():
 def call_to_out(call) -> CallOut:
     preview = ""
     count = 0
-    if getattr(call, "messages", None):
-        count = len(call.messages)
-        for m in reversed(call.messages):
+    # Avoid lazy-loading relationships in async context (MissingGreenlet).
+    state = attributes.instance_state(call)
+    messages = state.dict.get("messages")
+    if messages is not None:
+        count = len(messages)
+        for m in reversed(messages):
             if m.role == "user":
                 preview = m.content[:160]
                 break
