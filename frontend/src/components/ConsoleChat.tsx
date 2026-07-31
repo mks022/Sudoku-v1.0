@@ -37,7 +37,14 @@ export function ConsoleChat({
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [listening, setListening] = useState(false);
-  const [speakLive, setSpeakLive] = useState(true);
+  const [speakLive, setSpeakLive] = useState(() => {
+    try {
+      const saved = localStorage.getItem("netguard.speakBreadcrumbs");
+      return saved == null ? true : saved === "true";
+    } catch {
+      return true;
+    }
+  });
   const [ragHints, setRagHints] = useState<string[]>([]);
   const [tools, setTools] = useState<string[]>([]);
   const [phase, setPhase] = useState("");
@@ -47,10 +54,15 @@ export function ConsoleChat({
   const voiceWsRef = useRef<WebSocket | null>(null);
   const seenNarrationKeys = useRef<Set<string>>(new Set());
   const callIdRef = useRef<number | null>(null);
+  const speakLiveRef = useRef(speakLive);
 
   useEffect(() => {
     callIdRef.current = callId;
   }, [callId]);
+
+  useEffect(() => {
+    speakLiveRef.current = speakLive;
+  }, [speakLive]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -103,6 +115,18 @@ export function ConsoleChat({
     }
   }, [liveEvents, speakLive]);
 
+  function setBreadcrumbTts(on: boolean) {
+    setSpeakLive(on);
+    try {
+      localStorage.setItem("netguard.speakBreadcrumbs", String(on));
+    } catch {
+      /* ignore */
+    }
+    if (!on && "speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+  }
+
   async function ensureSession(): Promise<number> {
     if (callId) return callId;
     const call = await api.calls.create("hybrid", "Live console session");
@@ -136,15 +160,20 @@ export function ConsoleChat({
               meta: { narration: true, phase: msg.phase, speak: true },
             },
           ]);
-          if (speakLive && msg.speak !== false) speakText(msg.text);
-        } else if (msg.type === "narration_audio" && msg.audio_b64) {          try {
-            const bytes = Uint8Array.from(atob(msg.audio_b64), (c) => c.charCodeAt(0));
-            const blob = new Blob([bytes], { type: msg.mime || "audio/mpeg" });
-            const url = URL.createObjectURL(blob);
-            const audio = new Audio(url);
-            void audio.play();
-          } catch {
-            /* browser TTS already covers narration text */
+          if (speakLiveRef.current && msg.speak !== false) speakText(msg.text);
+        } else if (msg.type === "narration_audio" && msg.audio_b64) {
+          if (!speakLiveRef.current) {
+            /* breadcrumb TTS toggled off */
+          } else {
+            try {
+              const bytes = Uint8Array.from(atob(msg.audio_b64), (c) => c.charCodeAt(0));
+              const blob = new Blob([bytes], { type: msg.mime || "audio/mpeg" });
+              const url = URL.createObjectURL(blob);
+              const audio = new Audio(url);
+              void audio.play();
+            } catch {
+              /* browser TTS already covers narration text */
+            }
           }
         } else if (msg.type === "pass_aborted" || msg.type === "abort_ack") {
           if ("speechSynthesis" in window) window.speechSynthesis.cancel();
@@ -162,7 +191,7 @@ export function ConsoleChat({
               meta: { narration: true, phase: "abort", abort_info: msg.abort_info },
             },
           ]);
-          if (speakLive) {
+          if (speakLiveRef.current) {
             speakText("Aborting the current approach and closing MCP threads.");
           }
         } else if (msg.type === "assistant_text") {
@@ -181,7 +210,7 @@ export function ConsoleChat({
           setRagHints(msg.rag || []);
           setBusy(false);
           setPhase("");
-          if (msg.speak && speakLive) speakText(msg.text);
+          if (msg.speak && speakLiveRef.current) speakText(msg.text);
         }
       } catch {
         /* ignore */
@@ -322,7 +351,20 @@ export function ConsoleChat({
     <div className="panel" style={{ display: "flex", flexDirection: "column", minHeight: 520 }}>
       <div className="panel-title" style={{ display: "flex", justifyContent: "space-between", gap: "0.5rem", flexWrap: "wrap" }}>
         <span>Operator channel · live troubleshooting</span>
-        <span style={{ display: "flex", gap: "0.4rem", alignItems: "center" }}>
+        <span style={{ display: "flex", gap: "0.65rem", alignItems: "center", flexWrap: "wrap" }}>
+          <label className="toggle-row" title="Speak live troubleshooting breadcrumbs via TTS">
+            <button
+              type="button"
+              className="toggle"
+              role="switch"
+              aria-checked={speakLive}
+              data-on={speakLive ? "true" : "false"}
+              onClick={() => setBreadcrumbTts(!speakLive)}
+            />
+            <span>
+              Breadcrumb TTS · <strong>{speakLive ? "on" : "off"}</strong>
+            </span>
+          </label>
           {busy && (
             <span className="badge warn">
               <span className="live-dot" style={{ background: "var(--warn)" }} />
@@ -386,11 +428,6 @@ export function ConsoleChat({
           {error}
         </div>
       )}
-
-      <label className="switch" style={{ marginTop: "0.75rem" }}>
-        <input type="checkbox" checked={speakLive} onChange={(e) => setSpeakLive(e.target.checked)} />
-        Speak troubleshooting breadcrumbs (TTS)
-      </label>
 
       <form className="chat-compose" onSubmit={onSubmit}>
         <button
